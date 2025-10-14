@@ -1,3 +1,61 @@
+# Limita el rango de fechas para la API de Binance
+def clamp_to_api_range(start_ms, end_ms, max_days=30):
+    now_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
+    if end_ms > now_ms:
+        end_ms = now_ms
+    min_start = end_ms - max_days * 24 * 60 * 60 * 1000
+    if start_ms < min_start:
+        start_ms = min_start
+    return start_ms, end_ms
+# --- FUNCIONES DE FEATURES Y ETIQUETADO ---
+def add_macro_pair(df_sym, df_eth_indic):
+    aux = df_sym[["timestamp"]].merge(
+        df_eth_indic[["timestamp","close","ATR","EMA7","EMA25"]]
+        .rename(columns={"close":"eth_close","ATR":"eth_ATR","EMA7":"eth_EMA7","EMA25":"eth_EMA25"}),
+        on="timestamp", how="left"
+    ).ffill()
+    out = df_sym.copy()
+    out["ret_sym_5m"]  = out["close"].pct_change(fill_method=None)
+    out["ret_sym_1h"]  = out["close"].pct_change(12, fill_method=None)
+    out["ret_eth_5m"]  = aux["eth_close"].pct_change(fill_method=None)
+    out["ret_eth_1h"]  = aux["eth_close"].pct_change(12, fill_method=None)
+    out["eth_atr_pct"] = (aux["eth_ATR"] / aux["eth_close"] * 100).replace([np.inf,-np.inf], np.nan)
+    out["sym_ema_slope"] = out["EMA7"] - out["EMA25"]
+    out["eth_ema_slope"] = aux["eth_EMA7"] - aux["eth_EMA25"]
+    return out
+
+def build_features(df):
+    X = df[FEATURE_COLS].shift(1)
+    return X.replace([np.inf,-np.inf], np.nan).ffill().bfill()
+
+def label_hits(df, k_tp, k_sl, H):
+    close, high, low = df["close"].values, df["high"].values, df["low"].values
+    atrp = df["ATR_pct"].values / 100.0
+    labels = np.full(len(df), np.nan)
+    for i in range(len(df)-H-1):
+        entry = close[i+1]
+        is_long = df["trend_long"].iloc[i+1] == 1
+        tp, sl = k_tp*atrp[i+1], k_sl*atrp[i+1]
+        hit = None
+        for j in range(i+2, i+2+H):
+            if j >= len(df):
+                break
+            if is_long:
+                if low[j]  <= entry*(1-sl):
+                    hit = 0
+                    break
+                if high[j] >= entry*(1+tp):
+                    hit = 1
+                    break
+            else:
+                if high[j] >= entry*(1+sl):
+                    hit = 0
+                    break
+                if low[j]  <= entry*(1-tp):
+                    hit = 1
+                    break
+        labels[i+1] = np.nan if hit is None else hit
+    return pd.Series(labels, index=df.index)
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -20,7 +78,7 @@ from tqdm import tqdm
 EXCHANGE_ID = "binanceusdm"
 TIMEFRAME = "5m"
 TRAIN_START, TRAIN_END = "2025-06-01 00:00:00", "2025-07-31 23:59:59"
-TEST_MONTHS = ["2025-08", "2025-09"]
+TEST_MONTHS = ["2025-09"]
 
 TAKER_FEE, SLIPPAGE = 0.0005, 0.0002
 MARGIN_USD_DEFAULT, LEVERAGE_DEFAULT = 100.0, 5.0
@@ -136,6 +194,8 @@ def load_cache(path):
 def fetch_funding(symbol, start, end):
     url = f"{BINANCE_FAPI}/fapi/v1/fundingRate"
     out, p = [], {"symbol": symbol, "limit": 1000, "startTime": start, "endTime": end}
+    total = end - start
+    last_time = start
     while True:
         try:
             d = binance_get(url, p)
@@ -143,8 +203,12 @@ def fetch_funding(symbol, start, end):
         if not d: break
         out += d
         if len(d) < 1000: break
-        p["startTime"] = d[-1]["fundingTime"] + 1
+        last_time = d[-1]["fundingTime"]
+        p["startTime"] = last_time + 1
+        percent = min(100, 100 * (last_time - start) / total)
+        print(f"Funding {symbol}: {percent:.1f}% completado")
         time.sleep(0.2)
+    print(f"Funding {symbol}: 100% completado")
     if not out: return pd.DataFrame(columns=["timestamp","fundingRate"])
     df = pd.DataFrame(out)
     df["timestamp"] = pd.to_datetime(df["fundingTime"], unit="ms", utc=True)
@@ -156,25 +220,39 @@ def fetch_funding(symbol, start, end):
 def fetch_open_interest_1h(symbol, start, end):
 
     url = f"{BINANCE_FAPI}/futures/data/openInterestHist"
-    step = 7 * 24 * 60 * 60 * 1000
+    step = 24 * 60 * 60 * 1000  # 1 día
     out, ms = [], start
+    total = end - start
     while ms <= end:
         e = min(end, ms + step - 1)
         p = {"symbol": symbol, "period": "1h", "startTime": ms, "endTime": e, "limit": 500}
-
-        try:
-
-# Agrega columnas de sesión horaria y día de la semana al DataFrame
-            d = binance_get(url, p)
-            if d: out += d
-            ms = e + 1; time.sleep(0.25)
-        except Exception:
+        print(f"Solicitando OI {symbol}: desde {ms} hasta {e}")
+        tries = 0
+        max_tries = 2
+        while tries < max_tries:
+            percent = min(100, 100 * (ms - start) / total)
+            print(f"OpenInterest {symbol}: {percent:.1f}% completado (intento {tries+1}/{max_tries})")
+            try:
+                import requests
+                r = requests.get(url, params=p, timeout=40)
+                print(f"Status: {r.status_code}")
+                if r.ok:
+                    d = r.json()
+                    print(f"Recibidos {len(d)} registros")
+                    if d: out += d
+                else:
+                    print(f"Error HTTP: {r.status_code} {r.text}")
+                ms = e + 1; time.sleep(2)
+                break
+            except Exception as ex:
+                tries += 1
+                print(f"Excepción: {ex}")
+                time.sleep(5.0)
+        else:
             ms = e + 1
+    print(f"OpenInterest {symbol}: 100% completado")
     if not out: return pd.DataFrame(columns=["timestamp","openInterest"])
     df = pd.DataFrame(out)
-
-# Clasifica el régimen de volatilidad en bajo, medio y alto usando ATR
-
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     val = "sumOpenInterestValue" if "sumOpenInterestValue" in df.columns else "sumOpenInterest"
     df["openInterest"] = pd.to_numeric(df[val], errors="coerce")
@@ -222,9 +300,19 @@ def fetch_long_short_1h(symbol, start, end):
 
 
 def get_or_fetch_context(sym_code, start_ms, end_ms, use_context=True, cache_dir=None):
+    # Debug: imprime las fechas legibles de los milisegundos
+    from datetime import datetime
+    def ms_to_str(ts):
+        if ts > 1e12:
+            ts /= 1000
+        return datetime.utcfromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+    print(f"[DEBUG] start_ms: {start_ms} ({ms_to_str(start_ms)}), end_ms: {end_ms} ({ms_to_str(end_ms)})")
     if not use_context:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     os.makedirs(cache_dir, exist_ok=True)
+    # Ajusta los rangos para la API (por defecto 30 días)
+    start_ms, end_ms = clamp_to_api_range(start_ms, end_ms, max_days=30)
+    print(f"[DEBUG] Rango ajustado para API: start_ms={start_ms}, end_ms={end_ms}, símbolo={sym_code}")
     fpath = cache_path(cache_dir, sym_code, "funding", start_ms, end_ms)
     opath = cache_path(cache_dir, sym_code, "open_interest", start_ms, end_ms)
     lpath = cache_path(cache_dir, sym_code, "longshort", start_ms, end_ms)
@@ -234,8 +322,14 @@ def get_or_fetch_context(sym_code, start_ms, end_ms, use_context=True, cache_dir
     if funding is None:
         funding = fetch_funding(sym_code, start_ms, end_ms); save_cache(funding, fpath)
     if oi is None:
-        oi = fetch_open_interest_1h(sym_code, start_ms, end_ms); save_cache(oi, opath)
+        # Para OI, usa siempre los últimos 30 días desde ahora
+        now_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
+        oi_start = now_ms - 30 * 24 * 60 * 60 * 1000
+        oi_end = now_ms
+        print(f"[DEBUG] OI usando rango real: {oi_start} ({datetime.utcfromtimestamp(oi_start/1000).strftime('%Y-%m-%d %H:%M:%S')}), {oi_end} ({datetime.utcfromtimestamp(oi_end/1000).strftime('%Y-%m-%d %H:%M:%S')})")
+        oi = fetch_open_interest_1h(sym_code, oi_start, oi_end); save_cache(oi, opath)
     if ls is None:
+        print(f"[DEBUG] Llamando a fetch_long_short_1h con start_ms={start_ms}, end_ms={end_ms}, símbolo={sym_code}")
         ls = fetch_long_short_1h(sym_code, start_ms, end_ms); save_cache(ls, lpath)
     return funding if funding is not None else pd.DataFrame(), \
            oi if oi is not None else pd.DataFrame(), \
@@ -312,19 +406,25 @@ def ensure_context_fallback(df5, funding, oi, ls):
                             on="timestamp", direction="backward",
                             tolerance=pd.Timedelta("8h"))
         out["fundingRate"] = out["fundingRate"].fillna(0.0)
-    if oi is None or oi.empty:
-        proxy = (out["close"].ewm(span=96, min_periods=20).mean() *
-                 out["volume"].ewm(span=96, min_periods=20).mean())
-        out["openInterest"] = proxy / (proxy.rolling(96, min_periods=20).mean() + 1e-9)
+    if ls is None or ls.empty:
+        tilt = (out["EMA7"] - out["EMA25"]) / (out["EMA25"].abs() + 1e-9)
+        glsr = 1.0 + _zscore(tilt).clip(-2, 2) * 0.05
+        out["glsr"] = glsr.fillna(np.nan)
+        out["tlsr"] = out["glsr"]
     else:
         out = pd.merge_asof(out, oi.sort_values("timestamp"),
                             on="timestamp", direction="backward",
                             tolerance=pd.Timedelta("4h"))
-    if ls is None or ls.empty:
-        tilt = (out["EMA7"] - out["EMA25"]) / (out["EMA25"].abs() + 1e-9)
-        glsr = 1.0 + _zscore(tilt).clip(-2, 2) * 0.05
-        out["glsr"] = glsr.fillna(1.0)
-        out["tlsr"] = out["glsr"]
+        if "openInterest" not in out.columns:
+            out["openInterest"] = np.nan
+        if "tlsr" not in out.columns:
+            out["tlsr"] = np.nan
+        if "glsr" not in out.columns:
+            out["glsr"] = np.nan
+    # Advertencia si hay muchos NaN en glsr/tlsr
+    nan_ratio = out["glsr"].isna().mean()
+    if nan_ratio > 0.2:
+        print(f"[ADVERTENCIA] Más del 20% de los valores de glsr son NaN. Revisa el rango de contexto disponible.")
     else:
         out = pd.merge_asof(out, ls.sort_values("timestamp"),
                             on="timestamp", direction="nearest",
@@ -332,50 +432,77 @@ def ensure_context_fallback(df5, funding, oi, ls):
         out["glsr"] = out["glsr"].fillna(1.0)
         out["tlsr"] = out["tlsr"].fillna(1.0)
     out["fundingRate_z"] = _zscore(out["fundingRate"])
+    if "openInterest" not in out.columns:
+        out["openInterest"] = np.nan
     out["oi_change_pct"] = out["openInterest"].pct_change(fill_method=None).fillna(0) * 100
     out["glsr_z"] = _zscore(out["glsr"])
     out["tlsr_z"] = _zscore(out["tlsr"])
     return out
 
-def add_macro_pair(df_sym, df_eth_indic):
-    aux = df_sym[["timestamp"]].merge(
-        df_eth_indic[["timestamp","close","ATR","EMA7","EMA25"]]
-        .rename(columns={"close":"eth_close","ATR":"eth_ATR","EMA7":"eth_EMA7","EMA25":"eth_EMA25"}),
-        on="timestamp", how="left"
-    ).ffill()
-    out = df_sym.copy()
-    out["ret_sym_5m"]  = out["close"].pct_change(fill_method=None)
-    out["ret_sym_1h"]  = out["close"].pct_change(12, fill_method=None)
-    out["ret_eth_5m"]  = aux["eth_close"].pct_change(fill_method=None)
-    out["ret_eth_1h"]  = aux["eth_close"].pct_change(12, fill_method=None)
-    out["eth_atr_pct"] = (aux["eth_ATR"] / aux["eth_close"] * 100).replace([np.inf,-np.inf], np.nan)
-    out["sym_ema_slope"] = out["EMA7"] - out["EMA25"]
-    out["eth_ema_slope"] = aux["eth_EMA7"] - aux["eth_EMA25"]
-    return out
-
-def build_features(df):
-    X = df[FEATURE_COLS].shift(1)
-    return X.replace([np.inf,-np.inf], np.nan).ffill().bfill()
-
-def label_hits(df, k_tp, k_sl, H):
-    close, high, low = df["close"].values, df["high"].values, df["low"].values
-    atrp = df["ATR_pct"].values / 100.0
-    labels = np.full(len(df), np.nan)
-    for i in range(len(df)-H-1):
-        entry = close[i+1]
-        is_long = df["trend_long"].iloc[i+1] == 1
-        tp, sl = k_tp*atrp[i+1], k_sl*atrp[i+1]
-        hit = None
-        for j in range(i+2, i+2+H):
-            if j >= len(df): break
-            if is_long:
-                if low[j]  <= entry*(1-sl): hit = 0; break
-                if high[j] >= entry*(1+tp): hit = 1; break
+# Descarga los ratios long/short (global y top) históricos (1h) para el símbolo
+def fetch_long_short_1h(symbol, start, end):
+    # Solo descarga globalLongShortAccountRatio, rango limitado a 7 días para debug
+    url = f"{BINANCE_FAPI}/futures/data/globalLongShortAccountRatio"
+    step = 7 * 24 * 60 * 60 * 1000
+    ms = start
+    total = end - start
+    all_data = []
+    while ms <= end:
+        e = min(end, ms + step - 1)
+        p = {"symbol": symbol, "period": "1h", "startTime": ms, "endTime": e, "limit": 500}
+        print(f"Solicitando LS {symbol}: desde {ms} hasta {e}")
+        try:
+            import requests
+            r = requests.get(url, params=p, timeout=30)
+            print(f"Status: {r.status_code}")
+            if r.ok:
+                data = r.json()
+                print(f"Recibidos {len(data)} registros")
+                all_data += data
             else:
-                if high[j] >= entry*(1+sl): hit = 0; break
-                if low[j]  <= entry*(1-tp): hit = 1; break
-        labels[i+1] = np.nan if hit is None else hit
-    return pd.Series(labels, index=df.index)
+                print(f"Error HTTP: {r.status_code} {r.text}")
+        except Exception as ex:
+            print(f"Excepción: {ex}")
+        ms = e + 1
+        time.sleep(2)
+    print(f"Total registros descargados: {len(all_data)}")
+    if all_data:
+        df = pd.DataFrame(all_data)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        df["glsr"] = pd.to_numeric(df["longShortRatio"], errors="coerce")
+        df["tlsr"] = df["glsr"]
+        return df[["timestamp", "glsr", "tlsr"]]
+    return pd.DataFrame(columns=["timestamp", "glsr", "tlsr"])
+                # ...existing code...
+
+    def label_hits(df, k_tp, k_sl, H):
+        close, high, low = df["close"].values, df["high"].values, df["low"].values
+        atrp = df["ATR_pct"].values / 100.0
+        labels = np.full(len(df), np.nan)
+        for i in range(len(df)-H-1):
+            entry = close[i+1]
+            is_long = df["trend_long"].iloc[i+1] == 1
+            tp, sl = k_tp*atrp[i+1], k_sl*atrp[i+1]
+            hit = None
+            for j in range(i+2, i+2+H):
+                if j >= len(df):
+                    break
+                if is_long:
+                    if low[j]  <= entry*(1-sl):
+                        hit = 0
+                        break
+                    if high[j] >= entry*(1+tp):
+                        hit = 1
+                        break
+                else:
+                    if high[j] >= entry*(1+sl):
+                        hit = 0
+                        break
+                    if low[j]  <= entry*(1-tp):
+                        hit = 1
+                        break
+            labels[i+1] = np.nan if hit is None else hit
+        return pd.Series(labels, index=df.index)
 
 def ev_threshold(tp, sl, fee=TAKER_FEE, slip=SLIPPAGE):
     return (sl + 2*(fee+slip)) / (tp + sl)
@@ -471,7 +598,10 @@ def prepare_data(ex, sym_code, train_start, train_end, test_start, test_end, use
         eth_indic["close"]=np.nan; eth_indic["ATR"]=np.nan; eth_indic["EMA7"]=np.nan; eth_indic["EMA25"]=np.nan
     else:
         eth_indic = add_indicators(eth)
-    s = utc_ms(train_start); e = utc_ms(test_end)
+    # Ajusta los milisegundos para que nunca sean mayores al momento actual
+    now_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
+    s = min(utc_ms(train_start), now_ms)
+    e = min(utc_ms(test_end), now_ms)
     print("   📥 Funding/OI/LS (con caché)...")
     funding, oi, ls = get_or_fetch_context(sym_code, s, e, use_context=use_context, cache_dir=cache_dir)
     print("   🔗 Merge contexto + fallbacks...")
@@ -487,7 +617,7 @@ def prepare_data(ex, sym_code, train_start, train_end, test_start, test_end, use
     Xtr_mat = scaler.fit_transform(Xtr_full.fillna(0))
     Xte_mat = scaler.transform(Xte_full.fillna(0))
     Xtr = pd.DataFrame(Xtr_mat, columns=Xtr_full.columns, index=Xtr_full.index)
-    Xte = pd.DataFrame(Xte_mat, columns=Xtr_full.columns, index=Xtr_full.index)
+    Xte = pd.DataFrame(Xte_mat, columns=Xtr_full.columns, index=Xte_full.index)
     return tr, te, Xtr, Xte
 
 def train_model(X, y):
@@ -573,15 +703,17 @@ def main():
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     months = TEST_MONTHS[:]
 
-    total_tasks = len(symbols) * len(months)
-    task_bar = tqdm(total=total_tasks, desc="Progreso global (símbolo×mes)")
 
+    total_tasks = len(symbols) * len(months)
     rows = []
     all_trades = {sym: [] for sym in symbols}
+    start_time = time.time()
+    completed_tasks = 0
 
     for sym in symbols:
         for m in months:
             print(f"\n========== [{sym}] Evaluating {m} (5m) ==========")
+            task_start = time.time()
             best, trades = run_for_month(
                 ex, sym, m,
                 avoid_vr_low=not args.allow_vr_low,
@@ -594,9 +726,12 @@ def main():
             )
             rows.append({"symbol":sym,"month":m,**best.to_dict(),"margin_usd":args.margin_usd,"leverage":args.leverage})
             all_trades[sym].append(pd.DataFrame(trades))
-            task_bar.update(1)
-
-    task_bar.close()
+            completed_tasks += 1
+            elapsed = time.time() - start_time
+            avg_per_task = elapsed / completed_tasks
+            remaining = avg_per_task * (total_tasks - completed_tasks)
+            percent = (completed_tasks / total_tasks) * 100
+            print(f"Progreso: {completed_tasks}/{total_tasks} ({percent:.1f}%) | Tiempo estimado restante: {remaining/60:.1f} min")
 
     summary = pd.DataFrame(rows)
     combo = summary.groupby("month", as_index=False)[["pnl"]].sum().rename(columns={"pnl":"pnl_usd"})
