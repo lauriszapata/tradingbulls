@@ -48,11 +48,15 @@ FEATURE_COLS = [
 
 def utc_ms(s): return int(pd.Timestamp(s, tz="UTC").timestamp() * 1000)
 
+# Convierte una fecha en string a milisegundos UTC
+
 def get_exchange():
     ex = getattr(ccxt, EXCHANGE_ID)({"enableRateLimit": True})
     ex.timeout = 20000
     ex.enableRateLimit = True
     return ex
+
+# Inicializa el objeto de exchange CCXT para Binance USDM
 
 def http_get_with_retries(url, params, retries=5, backoff=1.8, timeout=20):
     last_err=None
@@ -65,6 +69,8 @@ def http_get_with_retries(url, params, retries=5, backoff=1.8, timeout=20):
             last_err = e
         time.sleep(backoff ** a)
     raise last_err if last_err else RuntimeError("HTTP error")
+
+# Realiza una petición HTTP con reintentos exponenciales
 
 def fetch_ohlcv_all(ex, sym, tf, s_ms, e_ms, lim=1000):
     out, ms = [], s_ms
@@ -94,18 +100,28 @@ def fetch_ohlcv_all(ex, sym, tf, s_ms, e_ms, lim=1000):
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     return df.drop_duplicates("timestamp").sort_values("timestamp")
 
+# Descarga todas las velas OHLCV en el rango dado, con control de reintentos y barra de progreso
+
 def binance_get(url, params): return http_get_with_retries(url, params, 5, 1.8, 20)
+
+# Wrapper para peticiones HTTP a la API de Binance con reintentos
 
 def cache_path(cache_dir, sym, name, start_ms, end_ms):
     return os.path.join(cache_dir, f"{name}_{sym}_{start_ms}_{end_ms}.parquet")
+
+# Genera la ruta de archivo para caché de contexto
+
 
 def save_cache(df, path):
     try:
         if df is None: return
         os.makedirs(os.path.dirname(path), exist_ok=True)
         df.to_parquet(path, index=False)
+
     except Exception:
         pass
+
+# Guarda un DataFrame en caché (formato parquet)
 
 def load_cache(path):
     try:
@@ -114,6 +130,8 @@ def load_cache(path):
     except Exception:
         return None
     return None
+
+# Carga un DataFrame desde caché si existe
 
 def fetch_funding(symbol, start, end):
     url = f"{BINANCE_FAPI}/fapi/v1/fundingRate"
@@ -133,14 +151,20 @@ def fetch_funding(symbol, start, end):
     df["fundingRate"] = pd.to_numeric(df["fundingRate"], errors="coerce")
     return df[["timestamp","fundingRate"]]
 
+# Descarga la tasa de fondeo histórica para el símbolo
+
 def fetch_open_interest_1h(symbol, start, end):
+
     url = f"{BINANCE_FAPI}/futures/data/openInterestHist"
     step = 7 * 24 * 60 * 60 * 1000
     out, ms = [], start
     while ms <= end:
         e = min(end, ms + step - 1)
         p = {"symbol": symbol, "period": "1h", "startTime": ms, "endTime": e, "limit": 500}
+
         try:
+
+# Agrega columnas de sesión horaria y día de la semana al DataFrame
             d = binance_get(url, p)
             if d: out += d
             ms = e + 1; time.sleep(0.25)
@@ -148,10 +172,15 @@ def fetch_open_interest_1h(symbol, start, end):
             ms = e + 1
     if not out: return pd.DataFrame(columns=["timestamp","openInterest"])
     df = pd.DataFrame(out)
+
+# Clasifica el régimen de volatilidad en bajo, medio y alto usando ATR
+
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     val = "sumOpenInterestValue" if "sumOpenInterestValue" in df.columns else "sumOpenInterest"
     df["openInterest"] = pd.to_numeric(df[val], errors="coerce")
     return df[["timestamp","openInterest"]]
+
+# Descarga el interés abierto histórico (1h) para el símbolo
 
 def fetch_long_short_1h(symbol, start, end):
     frames=[]
@@ -176,14 +205,21 @@ def fetch_long_short_1h(symbol, start, end):
         frames.append(df[["timestamp",tag]])
     if not frames: return pd.DataFrame(columns=["timestamp","glsr","tlsr"])
     m=None
+
+# Calcula indicadores técnicos y agrega columnas al DataFrame
     for f in frames:
         m=f if m is None else pd.merge_asof(
             m.sort_values("timestamp"),
             f.sort_values("timestamp"),
             on="timestamp",
+
+# Calcula el z-score móvil de una serie
             direction="nearest",
             tolerance=pd.Timedelta("65min"))
     return m.sort_values("timestamp")
+
+# Descarga los ratios long/short (global y top) históricos (1h) para el símbolo
+
 
 def get_or_fetch_context(sym_code, start_ms, end_ms, use_context=True, cache_dir=None):
     if not use_context:
@@ -205,12 +241,16 @@ def get_or_fetch_context(sym_code, start_ms, end_ms, use_context=True, cache_dir
            oi if oi is not None else pd.DataFrame(), \
            ls if ls is not None else pd.DataFrame()
 
+# Obtiene o descarga el contexto de mercado (funding, OI, LS) usando caché
+
 def add_session_features(df, tz='UTC'):
     ts = df["timestamp"]
     dt = ts.dt.tz_localize('UTC') if ts.dt.tz is None else ts
     dt = dt.dt.tz_convert(tz)
     df["dow"]  = dt.dt.weekday
     df["hour"] = dt.dt.hour
+
+# Realiza el merge de contexto y aplica fallback si falta información
     df["sess_asia"] = ((df["hour"]>=0)  & (df["hour"]<8)).astype(int)
     df["sess_eu"]   = ((df["hour"]>=7)  & (df["hour"]<15)).astype(int)
     df["sess_us"]   = ((df["hour"]>=12) & (df["hour"]<20)).astype(int)
@@ -227,11 +267,13 @@ def add_indicators(df):
     df = df.copy().sort_values("timestamp").reset_index(drop=True)
     df["EMA7"]  = ta.ema(df["close"], 7)
     df["EMA25"] = ta.ema(df["close"], 25)
+
     df["EMA99"] = ta.ema(df["close"], 99)
     df["RSI14"] = ta.rsi(df["close"], 14)
     adx = ta.adx(df["high"], df["low"], df["close"], 14)
     df["ADX14"] = adx["ADX_14"]
     df["ATR"]   = ta.atr(df["high"], df["low"], df["close"], 14)
+
     df["ATR_pct"] = (df["ATR"] / df["close"]).clip(lower=0) * 100
     bb = ta.bbands(df["close"], length=20, std=2.0)
     if bb is not None and not bb.empty:
@@ -251,12 +293,15 @@ def add_indicators(df):
     df["trend_short"] = (df["EMA7"] < df["EMA25"]).astype(int)
     df = add_session_features(df, tz='UTC')
     df = add_vol_regime(df)
+
     return df
+
 
 def _zscore(s, win=96, minp=10):
     m = s.rolling(win, min_periods=minp).mean()
     sd = s.rolling(win, min_periods=minp).std()
     return (s - m) / (sd + 1e-9)
+
 
 def ensure_context_fallback(df5, funding, oi, ls):
     out = df5.copy().sort_values("timestamp")
