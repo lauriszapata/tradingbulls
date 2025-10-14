@@ -77,7 +77,7 @@ from tqdm import tqdm
 
 EXCHANGE_ID = "binanceusdm"
 TIMEFRAME = "5m"
-TRAIN_START, TRAIN_END = "2025-06-01 00:00:00", "2025-07-31 23:59:59"
+TRAIN_START, TRAIN_END = "2025-06-01 00:00:00", "2025-08-31 23:59:59"
 TEST_MONTHS = ["2025-09"]
 
 TAKER_FEE, SLIPPAGE = 0.0005, 0.0002
@@ -406,31 +406,38 @@ def ensure_context_fallback(df5, funding, oi, ls):
                             on="timestamp", direction="backward",
                             tolerance=pd.Timedelta("8h"))
         out["fundingRate"] = out["fundingRate"].fillna(0.0)
-    if ls is None or ls.empty:
-        tilt = (out["EMA7"] - out["EMA25"]) / (out["EMA25"].abs() + 1e-9)
-        glsr = 1.0 + _zscore(tilt).clip(-2, 2) * 0.05
-        out["glsr"] = glsr.fillna(np.nan)
-        out["tlsr"] = out["glsr"]
+    
+    # Merge OI
+    if oi is None or oi.empty:
+        out["openInterest"] = np.nan
     else:
         out = pd.merge_asof(out, oi.sort_values("timestamp"),
                             on="timestamp", direction="backward",
                             tolerance=pd.Timedelta("4h"))
         if "openInterest" not in out.columns:
             out["openInterest"] = np.nan
-        if "tlsr" not in out.columns:
-            out["tlsr"] = np.nan
-        if "glsr" not in out.columns:
-            out["glsr"] = np.nan
-    # Advertencia si hay muchos NaN en glsr/tlsr
-    nan_ratio = out["glsr"].isna().mean()
-    if nan_ratio > 0.2:
-        print(f"[ADVERTENCIA] Más del 20% de los valores de glsr son NaN. Revisa el rango de contexto disponible.")
+    
+    # Merge LS
+    if ls is None or ls.empty:
+        tilt = (out["EMA7"] - out["EMA25"]) / (out["EMA25"].abs() + 1e-9)
+        glsr = 1.0 + _zscore(tilt).clip(-2, 2) * 0.05
+        out["glsr"] = glsr.fillna(1.0)
+        out["tlsr"] = out["glsr"]
     else:
         out = pd.merge_asof(out, ls.sort_values("timestamp"),
                             on="timestamp", direction="nearest",
                             tolerance=pd.Timedelta("65min"))
+        if "glsr" not in out.columns:
+            out["glsr"] = np.nan
+        if "tlsr" not in out.columns:
+            out["tlsr"] = np.nan
         out["glsr"] = out["glsr"].fillna(1.0)
         out["tlsr"] = out["tlsr"].fillna(1.0)
+        # Advertencia si hay muchos NaN antes del fillna
+        nan_ratio = out["glsr"].isna().mean()
+        if nan_ratio > 0.2:
+            print(f"[ADVERTENCIA] Más del 20% de los valores de glsr son NaN antes del fillna.")
+    
     out["fundingRate_z"] = _zscore(out["fundingRate"])
     if "openInterest" not in out.columns:
         out["openInterest"] = np.nan
@@ -582,7 +589,7 @@ def ccxt_pair(symbol_code):
     base = symbol_code.replace("USDT", "")
     return f"{base}/USDT:USDT"
 
-def prepare_data(ex, sym_code, train_start, train_end, test_start, test_end, use_context=True, cache_dir=None):
+def prepare_data(ex, sym_code, train_start, train_end, test_start, test_end, use_context=True, cache_dir=None, export_dir=None):
     sym_pair = ccxt_pair(sym_code)
     print(f"   ⛓️  {sym_code}: descargando OHLCV 5m (train/test)...")
     tr_raw = fetch_ohlcv_all(ex, sym_pair, TIMEFRAME, utc_ms(train_start), utc_ms(train_end))
@@ -610,6 +617,15 @@ def prepare_data(ex, sym_code, train_start, train_end, test_start, test_end, use
     print("   📈 Macro pair (ETH)...")
     tr = add_macro_pair(tr, eth_indic)
     te = add_macro_pair(te, eth_indic)
+    
+    # Exportar dataset completo con todos los indicadores y contexto
+    if export_dir:
+        combined = pd.concat([tr, te], ignore_index=True).sort_values("timestamp")
+        month_label = pd.Timestamp(test_start).strftime("%Y-%m")
+        export_path = os.path.join(export_dir, f"dataset_5m_{sym_code}_{month_label}.csv")
+        combined.to_csv(export_path, index=False)
+        print(f"   💾 Dataset exportado: {export_path}")
+    
     print("   🧱 Features + escalado...")
     Xtr_full = build_features(tr)
     Xte_full = build_features(te)
@@ -636,11 +652,11 @@ def kfold_auc(X, y, k=5):
         except: pass
     return np.mean(aucs) if aucs else 0.5
 
-def run_for_month(ex, sym_code, month, avoid_vr_low=True, sessions_eu_us_only=True, cooldown_bars=4, use_half_time_exit=True, use_breakeven=False, margin_usd=100.0, leverage=5.0, use_context=True, cache_dir=None):
+def run_for_month(ex, sym_code, month, avoid_vr_low=True, sessions_eu_us_only=True, cooldown_bars=4, use_half_time_exit=True, use_breakeven=False, margin_usd=100.0, leverage=5.0, use_context=True, cache_dir=None, export_dir=None):
     days = pd.Period(month).days_in_month
     test_start = f"{month}-01 00:00:00"
     test_end   = f"{month}-{days} 23:59:59"
-    tr, te, Xtr, Xte = prepare_data(ex, sym_code, TRAIN_START, TRAIN_END, test_start, test_end, use_context=use_context, cache_dir=cache_dir)
+    tr, te, Xtr, Xte = prepare_data(ex, sym_code, TRAIN_START, TRAIN_END, test_start, test_end, use_context=use_context, cache_dir=cache_dir, export_dir=export_dir)
     results, best_packs = [], []
 
     total_combos = len(GRID_H)*len(GRID_K_TP)*len(GRID_K_SL)*len(GRID_PMIN)*len(ADX_MIN_GRID)*len(DIST_VWAP_MAX_GRID)
@@ -722,7 +738,7 @@ def main():
                 use_half_time_exit=(not args.no_half_time_exit),
                 use_breakeven=args.breakeven,
                 margin_usd=args.margin_usd, leverage=args.leverage,
-                use_context=args.use_context, cache_dir=cache_dir
+                use_context=args.use_context, cache_dir=cache_dir, export_dir=out
             )
             rows.append({"symbol":sym,"month":m,**best.to_dict(),"margin_usd":args.margin_usd,"leverage":args.leverage})
             all_trades[sym].append(pd.DataFrame(trades))

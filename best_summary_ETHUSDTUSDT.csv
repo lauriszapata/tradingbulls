@@ -1,0 +1,2 @@
+trades,pnl,dd,dd_pct,pf,sh,hr,exp,k_tp,k_sl,H,p_min,adx_min,dist_vwap_max,require_pos_funding,require_glsr_above1,auc,win_rate,avg_pnl,median_pnl,max_consec_loss
+0,0,0,0,0,0,0,0,1.25,1.0,4,0.6,18,1.0,False,False,0.508777452775769,0.0,0,0,0
